@@ -46,6 +46,7 @@ import { fetchWithSystemProxy } from "@ccr/core/proxy/system-proxy-fetch";
 import { clientClosedRequestStatusCode, clientDisconnectMessage, coreGatewayAuthHeader, resolveStreamRequestLogOutcome, UpstreamRequestError } from "@ccr/core/gateway/internal/shared";
 import type { BrowserWebSearchMcpIntegration, BrowserWebSearchProtocolRecord, UpstreamFetchResult } from "@ccr/core/gateway/internal/shared";
 import { cancelResponseBody, destroyResponseStreams, fetchUpstreamWithFallback, mergeFallbackResponseHeaders, rewriteCapabilityResponseHeaders, uniqueStreams, upstreamResponseHeaders } from "@ccr/core/gateway/upstream/executor";
+import { buildTerminalStreamErrorFrame } from "@ccr/core/gateway/request/stream-terminal-error";
 import { requestProtocolForPath, shouldApplyGatewayRouting } from "@ccr/core/routing/protocol-endpoints";
 import { modelRegistryForConfig } from "@ccr/core/routing/model-registry";
 import { createClaudeCodeWebSearchContinuationContext, createHostedWebSearchProtocolContext, hostedWebSearchProtocolResponseStream, hostedWebSearchUnavailableMessage, prepareClaudeCodeWebSearchContinuationRequestBody, prepareHostedWebSearchProtocolRequestBody, selectClaudeCodeWebSearchContinuationRecords, selectHostedWebSearchProtocolRecords } from "@ccr/core/gateway/features/hosted-web-search/index";
@@ -1031,6 +1032,11 @@ export class GatewayRequestPipeline {
         : responseBody;
       const sampler = createBodySampler();
       const sseErrorDetector = createSseErrorDetector(responseHeaders.get("content-type") ?? undefined);
+      // The Codex compact transform rewrites an SSE upstream into a JSON body,
+      // so a terminal SSE frame would not belong to the client's protocol.
+      const terminalFrameContentType = transformCodexCompactResponse && codexCompactCompatResponseMode
+        ? undefined
+        : responseHeaders.get("content-type") ?? undefined;
       let streamDetectedError: string | undefined;
       const clientExperienceMeter = createStreamExperienceMeter({
         contentType: responseHeaders.get("content-type") ?? undefined,
@@ -1055,6 +1061,7 @@ export class GatewayRequestPipeline {
         meteredClientResponseBody
       ]);
       let upstreamStreamEnded = false;
+      let streamErrorHandled = false;
       let logRecorded = false;
       const writeStreamLog = (error?: string) => {
         if (logRecorded) {
@@ -1104,11 +1111,15 @@ export class GatewayRequestPipeline {
         }
       };
       const onResponseStreamError = (error: Error) => {
+        if (streamErrorHandled) {
+          return;
+        }
+        streamErrorHandled = true;
         failContextArchiveRequest(contextArchiveRecord, contextArchiveRequestConfig);
         upstreamExperienceMeter.finish();
         clientExperienceMeter.finish();
         streamDetectedError ??= sseErrorDetector.finish();
-        writeStreamLog(clientDisconnected ? clientDisconnectMessage : formatUpstreamErrorForLog(error, {
+        const streamErrorDetail = formatUpstreamErrorForLog(error, {
           attempts: upstreamResult.failedAttempts.length + 1,
           elapsedMs: Date.now() - startedAt,
           fallbackFailures: upstreamResult.failedAttempts.length,
@@ -1118,9 +1129,37 @@ export class GatewayRequestPipeline {
             (total, attempt) => total + Math.max(0, attempt.delayMs ?? 0),
             0
           )
-        }));
-        // .pipe() does not end the client response when a stage errors, so an
-        // upstream reset would leave the client waiting forever. Headers are
+        });
+        writeStreamLog(clientDisconnected ? clientDisconnectMessage : streamErrorDetail);
+        // .pipe() does not end the client response when a stage errors, and a
+        // bare socket kill leaves the client guessing whether the turn
+        // completed. When no terminal event reached the client yet, report the
+        // truncation in the client's own protocol, then end normally.
+        const terminalFrame = clientDisconnected || terminalFrameContentType === undefined
+          ? undefined
+          : buildTerminalStreamErrorFrame({
+              contentType: terminalFrameContentType,
+              detail: streamErrorDetail,
+              protocol: responseProtocol,
+              terminalEventSeen: sseErrorDetector.hasTerminalEvent()
+            });
+        if (terminalFrame !== undefined && !response.destroyed && !response.writableEnded) {
+          // The log body keeps the frame so a recorded truncation reads like the
+          // client saw it.
+          sampler.append(terminalFrame);
+          meteredClientResponseBody.unpipe(response);
+          try {
+            response.write(terminalFrame);
+            destroyResponseStreams(responseStreams);
+            response.end();
+            return;
+          } catch {
+            // The client vanished mid-write; the socket kill below is the only
+            // remaining option.
+          }
+        }
+        // No protocol-native terminal applies (non-SSE body, a protocol without
+        // an in-band error event, or a client that already left). Headers are
         // already sent; closing the socket is how a truncated stream fails.
         if (!response.destroyed) {
           response.destroy();
